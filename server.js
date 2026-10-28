@@ -172,6 +172,182 @@ function handleYtdl(u, req, res) {
   });
 }
 
+// ---------- YouTube channel / playlist listing + batch save ----------
+const MAX_LIST = 1000;
+const SAVE_DIR =
+  process.env.SAVE_DIR ||
+  (() => {
+    const dl = path.join(os.homedir(), "storage", "downloads");
+    return path.join(fs.existsSync(dl) ? dl : __dirname, "MediaSaver");
+  })();
+
+const isYoutubeUrl = (u) => /(^|\.)(youtube\.com|youtu\.be)$/.test(hostOf(u));
+const cookieArgs = () => (fs.existsSync(COOKIES) ? ["--cookies", COOKIES] : []);
+
+function fmtArgs(q) {
+  if (q === "audio") return ["-x", "--audio-format", "mp3", "--audio-quality", "0"];
+  if (q === "best") return ["-f", "bv*+ba/b", "--merge-output-format", "mp4"];
+  return ["-f", `bv*[height<=${q}]+ba/b[height<=${q}]/b`, "--merge-output-format", "mp4"];
+}
+
+function listTarget(raw, tab) {
+  const u = new URL(raw);
+  const p = u.pathname.replace(/\/+$/, "");
+  const list = u.searchParams.get("list");
+  if (p === "/playlist" && list && /^[\w-]+$/.test(list))
+    return { url: `https://www.youtube.com/playlist?list=${list}`, tab: "playlist" };
+  const m = p.match(/^\/(@[^/]+|channel\/[^/]+|c\/[^/]+|user\/[^/]+)/);
+  if (m) {
+    const t = tab === "shorts" ? "shorts" : "videos";
+    return { url: `https://www.youtube.com${m[0]}/${t}`, tab: t };
+  }
+  return null;
+}
+
+function handleList(u, res) {
+  const raw = (u.searchParams.get("url") || "").trim();
+  if (!isYoutubeUrl(raw)) return json(res, 400, { error: "Paste a YouTube channel or playlist link." });
+  const t = listTarget(raw, u.searchParams.get("tab"));
+  if (!t)
+    return json(res, 400, {
+      error: "That looks like a single video. Paste a channel link (youtube.com/@name) or a playlist link.",
+    });
+
+  execFile(
+    "yt-dlp",
+    ["--flat-playlist", "-J", "--no-warnings", "--playlist-end", String(MAX_LIST), ...cookieArgs(), "--", t.url],
+    { maxBuffer: 128 * 1024 * 1024, timeout: 180000 },
+    (err, stdout, stderr) => {
+      if (err) return json(res, 502, { error: ytdlpError(err, stderr) });
+      try {
+        const info = JSON.parse(stdout);
+        const flat = (arr) => arr.flatMap((e) => (e && e.entries ? flat(e.entries) : [e]));
+        const entries = flat(info.entries || [])
+          .filter((e) => e && /^[\w-]{11}$/.test(e.id || ""))
+          .map((e) => ({
+            id: e.id,
+            title: e.title || e.id,
+            duration: e.duration || 0,
+            thumb: `https://i.ytimg.com/vi/${e.id}/mqdefault.jpg`,
+          }));
+        json(res, 200, {
+          title: info.title || info.uploader || "YouTube",
+          tab: t.tab,
+          count: entries.length,
+          capped: entries.length >= MAX_LIST,
+          saveDir: SAVE_DIR,
+          entries,
+        });
+      } catch {
+        json(res, 502, { error: "Couldn't read the video list." });
+      }
+    }
+  );
+}
+
+const jobs = new Map();
+let batchRunning = false;
+
+function readBody(req, limit = 1e6) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (c) => {
+      data += c;
+      if (data.length > limit) {
+        reject(new Error("Body too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+async function handleBatchStart(req, res) {
+  if (batchRunning) return json(res, 429, { error: "A batch is already running. Wait for it or cancel it." });
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return json(res, 400, { error: "Bad request." });
+  }
+  const ids = [...new Set(body.ids || [])].filter((id) => /^[\w-]{11}$/.test(id)).slice(0, MAX_LIST);
+  const q = QUALITIES.includes(body.q) ? body.q : "best";
+  if (!ids.length) return json(res, 400, { error: "Select at least one video." });
+
+  const id = Date.now().toString(36);
+  const job = { id, total: ids.length, done: 0, failed: 0, current: "", status: "running", errors: [], saveDir: SAVE_DIR, cancelled: false, child: null };
+  jobs.set(id, job);
+  batchRunning = true;
+  runBatch(job, ids, q);
+  json(res, 200, { id, saveDir: SAVE_DIR });
+}
+
+async function runBatch(job, ids, q) {
+  try {
+    fs.mkdirSync(SAVE_DIR, { recursive: true });
+  } catch (e) {
+    job.status = "finished";
+    job.failed = job.total;
+    job.errors.push("Can't create save folder: " + e.message);
+    batchRunning = false;
+    return;
+  }
+  for (const vid of ids) {
+    if (job.cancelled) break;
+    job.current = vid;
+    const result = await new Promise((resolve) => {
+      const child = spawn("yt-dlp", [
+        ...baseArgs(),
+        ...fmtArgs(q),
+        "--no-overwrites",
+        "--windows-filenames",
+        "--sleep-interval", "1",
+        "--max-sleep-interval", "4",
+        "--no-simulate",
+        "--print", "before_dl:%(title)s",
+        "-o", path.join(SAVE_DIR, "%(title).80s [%(id)s].%(ext)s"),
+        "--",
+        `https://www.youtube.com/watch?v=${vid}`,
+      ]);
+      job.child = child;
+      let err = "";
+      child.stdout.on("data", (d) => {
+        const line = String(d).trim().split("\n")[0];
+        if (line) job.current = line.slice(0, 100);
+      });
+      child.stderr.on("data", (d) => (err += d));
+      child.on("error", (e) => resolve({ ok: false, msg: ytdlpError(e, err) }));
+      child.on("close", (code) => resolve({ ok: code === 0, msg: ytdlpError(null, err) }));
+    });
+    if (result.ok) job.done++;
+    else if (!job.cancelled) {
+      job.failed++;
+      job.errors.push(`${vid}: ${result.msg}`);
+      if (job.errors.length > 5) job.errors.shift();
+    }
+  }
+  job.child = null;
+  job.current = "";
+  job.status = job.cancelled ? "cancelled" : "finished";
+  batchRunning = false;
+}
+
+function handleBatchStatus(u, res) {
+  const job = jobs.get(u.searchParams.get("id"));
+  if (!job) return json(res, 404, { error: "Batch not found (the server may have restarted)." });
+  const { child, ...pub } = job;
+  json(res, 200, pub);
+}
+
+function handleBatchCancel(u, res) {
+  const job = jobs.get(u.searchParams.get("id"));
+  if (!job) return json(res, 404, { error: "Batch not found." });
+  job.cancelled = true;
+  if (job.child) job.child.kill();
+  json(res, 200, { ok: true });
+}
+
 // ---------- routes ----------
 async function handleResolve(u, res) {
   const target = (u.searchParams.get("url") || "").trim();
@@ -215,6 +391,10 @@ http
     if (u.pathname === "/api/resolve") return handleResolve(u, res);
     if (u.pathname === "/api/download") return handlePinDownload(u, res);
     if (u.pathname === "/api/ytdl") return handleYtdl(u, req, res);
+    if (u.pathname === "/api/list") return handleList(u, res);
+    if (u.pathname === "/api/batch" && req.method === "POST") return handleBatchStart(req, res);
+    if (u.pathname === "/api/batch/status") return handleBatchStatus(u, res);
+    if (u.pathname === "/api/batch/cancel") return handleBatchCancel(u, res);
     const html = fs.readFileSync(path.join(__dirname, "public", "index.html"));
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(html);
