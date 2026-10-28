@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pin Saver — download Pinterest images and videos</title>
+<style>
+  :root{
+    --paper:#f3efe8; --ink:#1d1a17; --muted:#6f675e; --line:#d9d2c6;
+    --pin:#c8102e; --pin-ink:#fff; --card:#fbf9f5;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --paper:#17140f; --ink:#f1ece3; --muted:#9a9187; --line:#332e26; --card:#1f1b15; --pin:#e8445b; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+    font:17px/1.55 "Iowan Old Style","Palatino Linotype",Georgia,serif;}
+  main{max-width:640px;margin:0 auto;padding:48px 20px 80px}
+  h1{font-size:clamp(2.4rem,9vw,3.6rem);line-height:1;margin:0 0 12px;letter-spacing:-.02em;font-weight:700}
+  h1 span{color:var(--pin)}
+  .lede{color:var(--muted);margin:0 0 32px;max-width:46ch}
+  .row{display:flex;gap:8px}
+  input{flex:1;min-width:0;padding:14px 16px;font:inherit;font-size:16px;color:var(--ink);
+    background:var(--card);border:1.5px solid var(--line);border-radius:10px}
+  input:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid var(--pin);outline-offset:2px}
+  button,.dl{font:600 16px/1 system-ui,sans-serif;padding:14px 20px;border:0;border-radius:10px;
+    background:var(--pin);color:var(--pin-ink);cursor:pointer;text-decoration:none;display:inline-block;text-align:center}
+  button:disabled{opacity:.6;cursor:wait}
+  .err{margin-top:16px;color:var(--pin);font-family:system-ui,sans-serif;font-size:15px}
+  #result{margin-top:32px;display:none}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:16px}
+  .card img,.card video{display:block;width:100%;max-height:70vh;object-fit:contain;background:#0001}
+  .meta{padding:14px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;
+    font-family:system-ui,sans-serif;font-size:14px;color:var(--muted)}
+  .meta strong{color:var(--ink);font-weight:600}
+  .note{margin-top:40px;font-size:14px;color:var(--muted);border-top:1px solid var(--line);padding-top:16px}
+</style>
+</head>
+<body>
+<main>
+  <h1>Pin<span>Saver</span></h1>
+  <p class="lede">Paste a Pinterest link and get the original-quality image or the highest-resolution video file.</p>
+
+  <form class="row" id="form">
+    <input id="url" type="url" inputmode="url" placeholder="https://pinterest.com/pin/… or pin.it/…" required autocomplete="off">
+    <button id="go" type="submit">Get media</button>
+  </form>
+  <div class="err" id="err" role="alert"></div>
+
+  <section id="result" aria-live="polite"></section>
+
+  <p class="note">Only save content you own or have permission to use. Pins belong to their creators, and Pinterest's terms apply.</p>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const dlUrl = (file, name) => `/api/download?file=${encodeURIComponent(file)}&name=${encodeURIComponent(name)}`;
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("err").textContent = ""; $("result").style.display = "none";
+  $("go").disabled = true; $("go").textContent = "Fetching…";
+  try {
+    const r = await fetch("/api/resolve?url=" + encodeURIComponent($("url").value.trim()));
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error);
+    render(data);
+  } catch (ex) {
+    $("err").textContent = ex.message;
+  } finally {
+    $("go").disabled = false; $("go").textContent = "Get media";
+  }
+});
+
+function render(d) {
+  const base = (d.title || "pin").slice(0, 40) || "pin";
+  let html = "";
+  if (d.videos.length) {
+    const best = d.videos[0];
+    html += `<div class="card"><video src="${best}" controls playsinline poster="${d.images[0] || ""}"></video>
+      <div class="meta"><span><strong>Video</strong> · best available quality</span>
+      <a class="dl" href="${dlUrl(best, base)}">Download video</a></div></div>`;
+    if (d.videos.length > 1) {
+      html += `<p class="meta">Other versions: ` + d.videos.slice(1).map((v, i) =>
+        `<a href="${dlUrl(v, base + "_alt" + (i + 1))}">version ${i + 2}</a>`).join(" ") + `</p>`;
+    }
+  }
+  if (d.images.length) {
+    const img = d.images[0];
+    html += `<div class="card"><img src="${img}" alt="Pin preview" referrerpolicy="no-referrer">
+      <div class="meta"><span><strong>${d.videos.length ? "Cover image" : "Image"}</strong> · original size</span>
+      <a class="dl" href="${dlUrl(img, base)}">Download image</a></div></div>`;
+  }
+  $("result").innerHTML = html;
+  $("result").style.display = "block";
+}
+</script>
+</body>
+</html>
