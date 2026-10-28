@@ -1,0 +1,8 @@
+{
+  "name": "pin-saver",
+  "version": "1.0.0",
+  "description": "Download Pinterest images and videos in original quality",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
